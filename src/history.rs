@@ -33,6 +33,7 @@ use std::{
     ffi::CString,
     fs::File,
     io::{BufRead, Read, Seek, SeekFrom, Write},
+    mem::MaybeUninit,
     num::NonZeroUsize,
     ops::ControlFlow,
     os::{fd::AsRawFd, unix::fs::MetadataExt},
@@ -41,7 +42,7 @@ use std::{
 };
 
 use bitflags::bitflags;
-use libc::{fchown, flock, LOCK_EX, LOCK_SH, LOCK_UN};
+use libc::{fchown, flock, EINTR, LOCK_EX, LOCK_SH, LOCK_UN};
 use lru::LruCache;
 use nix::{fcntl::OFlag, sys::stat::Mode};
 use rand::Rng;
@@ -1358,8 +1359,15 @@ impl HistoryImpl {
             return false;
         }
 
-        let start_time = SystemTime::now();
-        let retval = unsafe { flock(file.as_raw_fd(), lock_type) };
+        let (ok, start_time) = loop {
+            let start_time = SystemTime::now();
+            if unsafe { flock(file.as_raw_fd(), lock_type) } != -1 {
+                break (true, start_time);
+            }
+            if errno::errno().0 != EINTR {
+                break (false, start_time);
+            }
+        };
         if let Ok(duration) = start_time.elapsed() {
             if duration > Duration::from_millis(250) {
                 FLOG!(
@@ -1372,7 +1380,7 @@ impl HistoryImpl {
                 ABANDONED_LOCKING.store(true);
             }
         }
-        retval != -1
+        ok
     }
 
     /// Unlock a history file.
@@ -1443,9 +1451,9 @@ fn format_history_record(
     // This warns for musl, but the warning is useless to us - there is nothing we can or should do.
     #[allow(deprecated)]
     let seconds = seconds as libc::time_t;
-    let mut timestamp: libc::tm = unsafe { std::mem::zeroed() };
+    let mut timestamp = MaybeUninit::uninit();
     if let Some(show_time_format) = show_time_format.and_then(|s| CString::new(s).ok()) {
-        if !unsafe { libc::localtime_r(&seconds, &mut timestamp).is_null() } {
+        if !unsafe { libc::localtime_r(&seconds, timestamp.as_mut_ptr()).is_null() } {
             const max_tstamp_length: usize = 100;
             let mut timestamp_str = [0_u8; max_tstamp_length];
             use libc::strftime;
@@ -1454,7 +1462,7 @@ fn format_history_record(
                     &mut timestamp_str[0] as *mut u8 as *mut libc::c_char,
                     max_tstamp_length,
                     show_time_format.as_ptr(),
-                    &timestamp,
+                    timestamp.as_ptr(),
                 )
             } != 0
             {
