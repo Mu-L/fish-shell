@@ -29,6 +29,7 @@ use std::cell::RefMut;
 use std::cell::UnsafeCell;
 use std::cmp;
 use std::io::BufReader;
+use std::mem::MaybeUninit;
 use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 use std::ops::Range;
@@ -242,7 +243,11 @@ pub(crate) fn initial_query(
     vars: Option<&dyn Environment>,
 ) {
     blocking_query.get_or_init(|| {
-        let query = if is_dumb() || IN_MIDNIGHT_COMMANDER.load() || IN_DVTM.load() {
+        let query = if is_dumb()
+            || IN_MIDNIGHT_COMMANDER.load()
+            || IN_DVTM.load()
+            || !isatty(STDOUT_FILENO)
+        {
             None
         } else {
             // Query for kitty keyboard protocol support.
@@ -656,10 +661,11 @@ pub fn reader_read(parser: &Parser, fd: RawFd, io: &IoChain) -> Result<(), Error
     // See also, commit 396bf12. Without the need for this workaround we would just write:
     // int inter = ((fd == STDIN_FILENO) && isatty(STDIN_FILENO));
     if fd == STDIN_FILENO {
-        let mut t: libc::termios = unsafe { std::mem::zeroed() };
+        let mut t = MaybeUninit::uninit();
         if isatty(STDIN_FILENO) {
             interactive = true;
-        } else if unsafe { libc::tcgetattr(STDIN_FILENO, &mut t) } == -1 && errno().0 == EIO {
+        } else if unsafe { libc::tcgetattr(STDIN_FILENO, t.as_mut_ptr()) } == -1 && errno().0 == EIO
+        {
             redirect_tty_output(false);
             interactive = true;
         }
@@ -1058,12 +1064,11 @@ pub fn reader_reading_interrupted(data: &mut ReaderData) -> i32 {
 }
 
 /// Read one line of input. Before calling this function, reader_push() must have been called in
-/// order to set up a valid reader environment. If nchars > 0, return after reading that many
+/// order to set up a valid reader environment. If nchars is given, return after reading that many
 /// characters even if a full line has not yet been read. Note: the returned value may be longer
 /// than nchars if a single keypress resulted in multiple characters being inserted into the
 /// commandline.
-pub fn reader_readline(parser: &Parser, nchars: usize) -> Option<WString> {
-    let nchars = NonZeroUsize::try_from(nchars).ok();
+pub fn reader_readline(parser: &Parser, nchars: Option<NonZeroUsize>) -> Option<WString> {
     let data = current_data().unwrap();
     let mut reader = Reader { parser, data };
     reader.readline(nchars)
@@ -1524,6 +1529,9 @@ impl<'a> Reader<'a> {
     }
 
     pub fn request_cursor_position(&mut self, out: &mut Outputter, q: CursorPositionQuery) {
+        if !isatty(STDOUT_FILENO) {
+            return;
+        }
         let mut query = self.blocking_query();
         assert!(query.is_none());
         *query = Some(TerminalQuery::CursorPositionReport(q));
@@ -2180,8 +2188,10 @@ impl<'a> Reader<'a> {
         unsafe { libc::tcsetpgrp(self.conf.inputfd, libc::getpgrp()) };
 
         // Get the current terminal modes. These will be restored when the function returns.
-        let mut old_modes: libc::termios = unsafe { std::mem::zeroed() };
-        if unsafe { libc::tcgetattr(self.conf.inputfd, &mut old_modes) } == -1 && errno().0 == EIO {
+        let mut old_modes = MaybeUninit::uninit();
+        if unsafe { libc::tcgetattr(self.conf.inputfd, old_modes.as_mut_ptr()) } == -1
+            && errno().0 == EIO
+        {
             redirect_tty_output(false);
         }
 
@@ -2275,7 +2285,7 @@ impl<'a> Reader<'a> {
         if EXIT_STATE.load(Ordering::Relaxed) != ExitState::FinishedHandlers as _ {
             // The order of the two conditions below is important. Try to restore the mode
             // in all cases, but only complain if interactive.
-            if unsafe { libc::tcsetattr(self.conf.inputfd, TCSANOW, &old_modes) } == -1
+            if unsafe { libc::tcsetattr(self.conf.inputfd, TCSANOW, old_modes.as_ptr()) } == -1
                 && is_interactive_session()
             {
                 if errno().0 == EIO {
@@ -2431,8 +2441,7 @@ impl<'a> Reader<'a> {
         });
 
         // If we ran `exit` anywhere, exit.
-        self.exit_loop_requested =
-            self.exit_loop_requested || self.parser.libdata().exit_current_script;
+        self.exit_loop_requested |= self.parser.libdata().exit_current_script;
         self.parser.libdata_mut().exit_current_script = false;
         if self.exit_loop_requested {
             return ControlFlow::Continue(());
@@ -3941,9 +3950,9 @@ impl<'a> Reader<'a> {
         // using a backslash, insert a newline.
         // If the user hits return while navigating the pager, it only clears the pager.
         if self.is_navigating_pager_contents() {
+            let search_field = &self.data.pager.search_field_line;
             if self.history_pager.is_some() && self.pager.selected_completion_idx.is_none() {
                 let range = 0..self.command_line.len();
-                let search_field = &self.data.pager.search_field_line;
                 let offset_from_end = search_field.len() - search_field.position();
                 let mut cursor = self.command_line.position();
                 let updated = replace_line_at_cursor(
@@ -3953,6 +3962,13 @@ impl<'a> Reader<'a> {
                 );
                 self.replace_substring(EditableLineTag::Commandline, range, updated);
                 self.command_line.set_position(cursor - offset_from_end);
+            } else if self
+                .pager
+                .selected_completion(&self.data.current_page_rendering)
+                .is_none()
+            {
+                let failed_search = search_field.text().to_owned();
+                self.insert_string(EditableLineTag::Commandline, &failed_search);
             }
             self.clear_pager();
             return true;
@@ -4259,10 +4275,10 @@ fn term_donate(quiet: bool /* = false */) {
 
 /// Copy the (potentially changed) terminal modes and use them from now on.
 pub fn term_copy_modes() {
-    let mut modes: libc::termios = unsafe { std::mem::zeroed() };
-    unsafe { libc::tcgetattr(STDIN_FILENO, &mut modes) };
+    let mut modes = MaybeUninit::uninit();
+    unsafe { libc::tcgetattr(STDIN_FILENO, modes.as_mut_ptr()) };
     let mut tty_modes_for_external_cmds = TTY_MODES_FOR_EXTERNAL_CMDS.lock().unwrap();
-    *tty_modes_for_external_cmds = modes;
+    *tty_modes_for_external_cmds = unsafe { modes.assume_init() };
     // We still want to fix most egregious breakage.
     // E.g. OPOST is *not* something that should be set globally,
     // and 99% triggered by a crashed program.
@@ -4877,7 +4893,13 @@ impl<'a> Reader<'a> {
         }
 
         let el = &self.data.command_line;
+        let autosuggestion = &self.autosuggestion;
         if self.is_at_line_with_autosuggestion() {
+            assert!(string_prefixes_string_maybe_case_insensitive(
+                autosuggestion.icase,
+                &el.text()[autosuggestion.search_string_range.clone()],
+                &autosuggestion.text
+            ));
             return;
         }
 
